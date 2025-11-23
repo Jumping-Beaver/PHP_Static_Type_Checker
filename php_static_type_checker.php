@@ -13,12 +13,15 @@ class DefinedVariable
 
 class ASTContext
 {
+    # Terminology: A "classtype" can be a class, trait or interface.
+    # Beware that a `ReflectionClass` instance can describe a trait or interface, but
+    # `class_exists(...)` returns false for traits and interfaces.
+
     public null|\ReflectionFunctionAbstract|AST_ReflectionFunctionAbstract $function = null;
     public array $included_files = [];
     public bool $make_self_check = false;
     public ?\ReflectionClass $class = null;
-    public array $defined_classes = [];
-    public array $defined_interface_names = [];
+    public array $defined_classtypes = [];
     public array $defined_functions = [];
     public array $defined_variables = [];
     public array $defined_constants = [];
@@ -28,7 +31,11 @@ class ASTContext
     public string $file_name;
     public array $global_scope_variables;
     public array $use_aliases = [];
+    public array $use_function_aliases = [];
+    public array $use_const_aliases = [];
     public bool $is_in_assignment = false;
+    public array $ignored_errors = [];
+    public ?\ReflectionClass $classtype;
 
     function __construct()
     {
@@ -73,7 +80,7 @@ class ASTContext
 
     function constant_exists_with_fallback(\ast\Node $name_node): bool
     {
-        $name = $this->normalize_constant_name($this->fq_name($name_node));
+        $name = $this->normalize_constant_name($this->fq_name($name_node, $this->use_const_aliases));
         if (array_key_exists($name, $this->defined_constants) || defined($name)) {
             return true;
         }
@@ -88,7 +95,7 @@ class ASTContext
     {
         # A return value of `null` can mean an unknown type or that the constant does not exist.
 
-        $name = $this->normalize_constant_name($this->fq_name($name_node));
+        $name = $this->normalize_constant_name($this->fq_name($name_node, $this->use_const_aliases));
         if (array_key_exists(strtolower($name), $this->defined_constants)) {
             return get_primitive_type($this->defined_constants[strtolower($name)]);
         }
@@ -111,14 +118,14 @@ class ASTContext
         return null;
     }
 
-    function get_class(string $name): ?\ReflectionClass
+    function get_classtype(string $name): ?\ReflectionClass
     {
         # Beware that PHP's autoloading might not get triggered correctly if we passed lowercased
-        # identifiers, even if they would normally be case-insensitive in PHP.
+        # identifiers, even though they are case-insensitive in PHP code.
 
         $lower_name = strtolower($name);
-        if (array_key_exists($lower_name, $this->defined_classes)) {
-            return $this->defined_classes[$lower_name];
+        if (array_key_exists($lower_name, $this->defined_classtypes)) {
+            return $this->defined_classtypes[$lower_name];
         }
         if (class_exists($name) || trait_exists($name) || interface_exists($name)) {
             return new \ReflectionClass($name);
@@ -128,7 +135,7 @@ class ASTContext
 
     function get_function(\ast\Node $name_node): ?\ReflectionFunctionAbstract
     {
-        $name = $this->fq_name($name_node);
+        $name = $this->fq_name($name_node, $this->use_function_aliases);
         if (array_key_exists(strtolower($name), $this->defined_functions)) {
             return $this->defined_functions[strtolower($name)];
         }
@@ -153,12 +160,14 @@ class ASTContext
 
     function class_exists(string $name)
     {
-        return array_key_exists(strtolower($name), $this->defined_classes) || class_exists($name);
+        $class = this->defined_classtypes[strtolower($name)] ?? null;
+        return $class !== null && !$class->isInterface() && !$class->isTrait() || class_exists($name);
     }
 
-    function interface_exists(string $name)
+    function classtype_exists(string $name)
     {
-        return in_array(strtolower($name), $this->defined_interface_names) || interface_exists($name);
+        return array_key_exists(strtolower($name), $this->defined_classtypes) ||
+            class_exists($name) || interface_exists($name) || trait_exists($name);
     }
 
     function function_exists(string $name)
@@ -166,14 +175,14 @@ class ASTContext
         return array_key_exists(strtolower($name), $this->defined_functions) || function_exists($name);
     }
 
-    function fq_name(\ast\Node $name_node): string
+    function fq_name(\ast\Node $name_node, array $use_aliases): string
     {
         if ($name_node->flags === \ast\flags\NAME_FQ) {
             return $name_node->children['name'];
         }
         $split = explode('\\', $name_node->children['name'], 2);
-        if (array_key_exists(strtolower($split[0]), $this->use_aliases)) {
-            $split[0] = $this->use_aliases[strtolower($split[0])];
+        if (array_key_exists(strtolower($split[0]), $use_aliases)) {
+            $split[0] = $use_aliases[strtolower($split[0])];
         }
         else {
             $split[0] = $this->namespace . $split[0];
@@ -184,31 +193,31 @@ class ASTContext
     function fq_class_name(\ast\Node $name_node, bool $print_error=true): ?string
     {
         if ($name_node->children['name'] === 'self') {
-            if ($this->class === null) {
+            if ($this->classtype === null) {
                 if ($print_error) {
                     $this->error('Cannot access `self` when no class scope is active', $name_node);
                 }
                 return null;
             }
-            return $this->class->getName();
+            return $this->classtype->getName();
         }
         if ($name_node->children['name'] === 'static') {
-            if ($this->class === null) {
+            if ($this->classtype === null) {
                 if ($print_error) {
                     $this->error('Cannot access `static` when no class scope is active', $name_node);
                 }
                 return null;
             }
-            return $this->class->getName();
+            return $this->classtype->getName();
         }
         if ($name_node->children['name'] === 'parent') {
-            if ($this->class === null) {
+            if ($this->classtype === null) {
                 if ($print_error) {
                     $this->error('Cannot access `parent` when no class scope is active', $name_node);
                 }
                 return null;
             }
-            $parent = $this->class->getParentClass();
+            $parent = $this->classtype->getParentClass();
             if ($parent === false) {
                 if ($print_error) {
                     $this->error('Cannot access `parent` when the current class has no parent',
@@ -218,15 +227,16 @@ class ASTContext
             }
             return $parent->getName();
         }
-        return $this->fq_name($name_node);
+        return $this->fq_name($name_node, $this->use_aliases);
     }
 
     function reflection_type_from_ast(?\ast\Node $node, bool $has_default_null=false):
         null|\ReflectionType
     {
         # About `$has_default_null`: Parameter type hints with the default value `null` are implicitly
-        # made nullable. This misfeature of PHP is an element of surprise and adds undesirable
-        # complexity to static code analysis. I hope it will be removed in future PHP versions.
+        # made nullable, unless they are constructor properties. This misfeature of PHP is an element
+        # of surprise and adds undesirable complexity to static code analysis. I hope it will be
+        # removed in future PHP versions.
 
         if ($node === null) {
             return null;
@@ -254,6 +264,9 @@ class ASTContext
 
     function fill_use_aliases(\ast\Node $node)
     {
+        # A use statement can reference a class, whose existence can be validated, or a namespace, whose
+        # existence cannot be validated. Overall, use statements cannot be validated.
+
         foreach ($node->children as $use_elem) {
             if ($use_elem->children['alias'] === null) {
                 $split = explode('\\', $use_elem->children['name']);
@@ -262,7 +275,15 @@ class ASTContext
             else {
                 $alias = $use_elem->children['alias'];
             }
-            $this->use_aliases[strtolower($alias)] = $use_elem->children['name'];
+            if ($node->flags & \ast\flags\USE_FUNCTION) {
+                $this->use_function_aliases[strtolower($alias)] = $use_elem->children['name'];
+            }
+            else if ($node->flags & \ast\flags\USE_CONST) {
+                $this->use_const_aliases[strtolower($alias)] = $use_elem->children['name'];
+            }
+            else {
+                $this->use_aliases[strtolower($alias)] = $use_elem->children['name'];
+            }
         }
     }
 
@@ -276,18 +297,21 @@ class ASTContext
 
     function error(string $message, \ast\Node $node): void
     {
-        print("`{$this->get_relative_file_name()}` line \e[1m{$node->lineno}\e[0m:\n$message\n");
+        $ignore_key = substr(sha1(basename($this->file_name) . sha1($message)), 0, 6);
+        if (in_array($ignore_key, $this->ignored_errors)) return;
+        print("`{$this->get_relative_file_name()}` line \e[1m{$node->lineno}\e[0m: (ignore key: $ignore_key)\n" .
+              "$message\n");
         $this->has_error = true;
     }
 
     function has_access(string $type_name, int $modifiers): bool
     {
-        if (($modifiers & \ast\flags\MODIFIER_PRIVATE) && $type_name !== $this->class?->getName()) {
+        if (($modifiers & \ast\flags\MODIFIER_PRIVATE) && $type_name !== $this->classtype?->getName()) {
             return false;
         }
         if (($modifiers & \ast\flags\MODIFIER_PROTECTED) &&
-            $type_name !== $this->class?->getName() && ($this->class?->getParentClass() === false ||
-            $type_name !== $this->class?->getParentClass()->getName()))
+            $type_name !== $this->classtype?->getName() && ($this->classtype?->getParentClass() === false ||
+            $type_name !== $this->classtype?->getParentClass()->getName()))
         {
             return false;
         }
@@ -384,11 +408,6 @@ function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): b
                 $type_allows_null = $type->allowsNull();
                 $type = $type->getName();
             }
-            $type = strtolower($type);
-            $supertype = strtolower($supertype);
-            if ($type === 'mixed' || $supertype === 'mixed') {
-                return true;
-            }
             if ($supertype instanceof \ReflectionIntersectionType) {
                 if ($type instanceof \ReflectionIntersectionType) {
                     $types = $type->getTypes();
@@ -414,7 +433,7 @@ function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): b
                 }
                 continue;
             }
-            if (($parent = $ctx->get_class($type)) !== null) {
+            if (($parent = $ctx->get_classtype($type)) !== null) {
                 $parents_interfaces = $parent->getInterfaceNames();
                 while (($parent = $parent->getParentClass()) !== false) {
                     $parents_interfaces []= $parent->getName();
@@ -424,9 +443,11 @@ function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): b
             else {
                 $parents_interfaces = [];
             }
-
-            if ($supertype === 'object' && $ctx->class_exists($type) ||
-                $type === 'object' && $ctx->class_exists($supertype) ||
+            $type = strtolower($type);
+            $supertype = strtolower($supertype);
+	    if ($type === 'mixed' || $supertype === 'mixed' ||
+		$supertype === 'object' && !in_array($type, NON_CLASS_TYPES) ||
+                $type === 'object' && !in_array($supertype, NON_CLASS_TYPES) ||
                 $type === 'closure' && $supertype === 'callable' ||
                 $type === 'int' && $supertype === 'float' ||
                 $type === 'callable' && $supertype === 'closure' ||
@@ -438,7 +459,6 @@ function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): b
                 $type_allows_null && $supertype === 'null' ||
                 $type === $supertype ||
                 in_array($supertype, $parents_interfaces) ||
-                $ctx->class_exists($type) &&
                 in_array($supertype === 'string' ? 'stringable' : $supertype, $parents_interfaces))
             {
                 return true;
@@ -452,7 +472,6 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
     bool $is_in_assignment=false): array
 {
     # Return value `[null]` means we don't know the type, `[]` means the type is invalid.
-    # But sometimes we return `[null]` for invalid types to avoid duplicate error messages.
 
     assert($node !== null);
     if (!($node instanceof \ast\Node)) {
@@ -478,8 +497,12 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
         }
         $possible_types = [];
         foreach ($possible_classes as $possible_class) {
-            $class = $ctx->get_class($possible_class);
+            $class = $ctx->get_classtype($possible_class);
             if ($class === null) {
+                if ($print_error) {
+                    $ctx->error("Type `$possible_class` is undefined", $node->children['class']);
+                    $print_error = false;
+                }
                 continue;
             }
             if ($node->kind === \ast\AST_CLASS_CONST) {
@@ -506,10 +529,10 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
         }
         if ($print_error) {
             if ($node->kind === \ast\AST_CLASS_CONST) {
-                $ctx->error("Class constant `{$node->children['const']}` is undefined or inaccessible", $node);
+                $ctx->error("Type constant `{$node->children['const']}` is undefined or inaccessible", $node);
             }
             else {
-                $ctx->error("Class property `{$node->children['prop']}` is undefined or inaccessible", $node);
+                $ctx->error("Type property `{$node->children['prop']}` is undefined or inaccessible", $node);
             }
         }
         return [null];
@@ -540,6 +563,7 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             return [null];
         }
         $class_name = $ctx->fq_class_name($node->children['class'], $print_error);
+        return [$class_name];
         if (!$ctx->class_exists($class_name)) {
             if ($print_error) {
                 $ctx->error("Class `$class_name` is undefined", $node->children['class']);
@@ -583,7 +607,7 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                 if (in_array($type_name, NON_CLASS_TYPES)) {
                     continue;
                 }
-                $class = $ctx->get_class($type_name);
+                $class = $ctx->get_classtype($type_name);
                 if ($class === null) {
                     return [null];
                 }
@@ -618,6 +642,29 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
     return [null];
 }
 
+function get_function_signature(\ReflectionFunctionAbstract $function): string
+{
+    $signature = '';
+    if ($function instanceof \ReflectionMethod) {
+        $signature .= $function->getDeclaringClass()->getName() . '::';
+    }
+    $signature .= $function->getName() . '(';
+    $first = true;
+    foreach ($function->getParameters() as $parameter) {
+        if (!$first) {
+            $signature .= ', ';
+        }
+        $signature .= type_to_string([$parameter->getType()]);
+        $signature .= ' $' . $parameter->getName();
+        $first = false;
+    }
+    $signature .= ')';
+    if ($function->getReturnType() !== null) {
+        $signature .= ': ' . type_to_string([$function->getReturnType()]);
+    }
+    return $signature;
+}
+
 function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $function, \ast\Node $node): void
 {
     if ($node->kind === \ast\AST_CALLABLE_CONVERT) {
@@ -647,7 +694,8 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
         }
         else if ($index >= count($function->getParameters())) {
             if (!$function->isVariadic()) {
-                $ctx->error("Too many arguments for function `{$function->getName()}`", $node);
+                $signature = get_function_signature($function);
+                $ctx->error("Too many arguments for function `$signature`", $node);
                 break;
             }
             continue;
@@ -661,7 +709,8 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
             !in_array($arg->kind, [\ast\AST_VAR, \ast\AST_PROP, \ast\AST_DIM])))
         {
             $index += 1;
-            $ctx->error("In the call to `{$function->getName()}`, the expression in argument $index " .
+            $signature = get_function_signature($function);
+            $ctx->error("In the call to `$signature`, the expression in argument $index " .
                 "cannot be passed by reference", $node);
             return;
         }
@@ -674,14 +723,14 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
             $arg_types_str = type_to_string($arg_types);
             $parameter_types_str = type_to_string([$parameter_type]);
             $index += 1;
-            $ctx->error("In the call to `{$function->getName()}`, type `$arg_types_str` of argument $index " .
+            $signature = get_function_signature($function);
+            $ctx->error("In the call to `$signature`, type `$arg_types_str` of argument $index " .
                 "is not compatible with parameter type `$parameter_types_str`", $node);
         }
     }
     foreach ($unspecified_parameters as $p) {
         if (!$p->isOptional()) {
-            $ctx->error("The call to `{$function->getName()}` lacks the required " .
-                "argument `{$p->getName()}`", $node);
+            $ctx->error("The call to `$signature` lacks the required argument `{$p->getName()}`", $node);
         }
     }
 }
@@ -696,11 +745,11 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
     }
     if (array_key_exists('class', $node->children)) { # Static call
         $is_static_call = true;
-        if ($node->children['class']->kind === \ast\AST_NAME) { # Example: `Klasse::method()`
+        if ($node->children['class']->kind === \ast\AST_NAME) { # Example: `Klasse::method()`, `Trait::CONSTANT`
             $possible_types = [$ctx->fq_class_name($node->children['class'])];
-            if (!$ctx->class_exists($possible_types[0])) {
+            if ($possible_types[0] !== null && !$ctx->classtype_exists($possible_types[0])) {
                 if ($print_error) {
-                    $ctx->error("Class `$possible_types[0]` is undefined", $node);
+                    $ctx->error("Type `$possible_types[0]` is undefined", $node);
                 }
                 $possible_types = [];
             }
@@ -724,17 +773,26 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         else if ($possible_type instanceof \ReflectionUnionType) {
             $possible_type = array_map(fn ($t) => $t->getName(), $possible_type->getTypes());
         }
+        else if ($possible_type instanceof TypeWithIgnoredMethod) {
+            if ($node->children['method'] === $possible_type->ignored_method) {
+                $possible_methods []= new IgnoredFunction($possible_type->ignored_method);
+            }
+            continue;
+        }
         else if (is_string($possible_type)) {
             $possible_type = [$possible_type];
         }
-        else {
+        else if ($possible_type === null) {
             return null;
+        }
+        else {
+            throw new \Exception();
         }
         foreach ($possible_type as $type_name) {
             if (in_array($type_name, NON_CLASS_TYPES)) {
                 continue;
             }
-            $class = $ctx->get_class($type_name);
+            $class = $ctx->get_classtype($type_name);
             if ($class === null) {
                 return null;
             }
@@ -754,6 +812,12 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         }
     }
     return $possible_methods;
+}
+
+class PossibleMethods
+{
+    public array $matches;
+    public array $all;
 }
 
 class AST_ReflectionIntersectionType extends \ReflectionIntersectionType
@@ -843,10 +907,10 @@ class AST_ReflectionNamedType extends \ReflectionNamedType
             $this->type_name = $node->getName();
         }
         else if ($node->kind === \ast\AST_TYPE && $node->flags === \ast\flags\TYPE_STATIC) {
-            if ($ctx->class === null) {
+            if ($ctx->classtype === null) {
                 $ctx->error('Cannot access `static` when no class scope is active', $node);
             }
-            $this->type_name = $ctx->class?->getName();
+            $this->type_name = $ctx->classtype?->getName();
         }
         else if ($node->kind === \ast\AST_TYPE) {
             $this->type_name = match ($node->flags) {
@@ -873,7 +937,7 @@ class AST_ReflectionNamedType extends \ReflectionNamedType
                 throw new \TypeError;
             }
             $this->type_name = $type_name;
-            if (!$ctx->class_exists($this->type_name) && !$ctx->interface_exists($this->type_name)) {
+            if (!$ctx->classtype_exists($this->type_name)) {
                 $ctx->error("Type `{$this->type_name}` in the type hint is undefined", $node);
             }
         }
@@ -1002,6 +1066,7 @@ trait AST_ReflectionFunctionAbstract
         $this->ctx->file_name = $this->file_name;
         $this->ctx->namespace = $this->namespace;
         $this->ctx->use_aliases = $this->use_aliases;
+
         if ($this->node->flags & \ast\flags\MODIFIER_ABSTRACT) {
             if ($this->node->flags & \ast\flags\MODIFIER_PRIVATE) {
                 $this->ctx->error("Abstract method `{$this->node->children['name']}` cannot be private",
@@ -1011,26 +1076,32 @@ trait AST_ReflectionFunctionAbstract
                 $this->ctx->error("Abstract method `{$this->node->children['name']}` cannot have a body",
                     $this->node);
             }
-            if ($this->ctx->class->isInterface() & \ast\flags\CLASS_INTERFACE) {
+            if ($this->ctx->classtype->isInterface() & \ast\flags\CLASS_INTERFACE) {
                 $this->ctx->error("Interface method `{$this->node->children['name']}` must not be abstract",
                     $this->node);
             }
         }
-        else if ($this->node->children['stmts'] === null && !$this->ctx->class->isInterface()) {
+        else if ($this->node->children['stmts'] === null && !$this->ctx->classtype->isInterface()) {
             $this->ctx->error("Non-abstract method `{$this->node->children['name']}` must have a body",
                 $this->node);
         }
-        if ($this->ctx->class?->isInterface() && (($this->node->flags & \ast\flags\MODIFIER_PROTECTED) ||
+        if ($this->ctx->classtype?->isInterface() && (($this->node->flags & \ast\flags\MODIFIER_PROTECTED) ||
             $this->node->flags & \ast\flags\MODIFIER_PRIVATE)) {
             $this->ctx->error("Interface method `{$this->node->children['name']}` must be public",
                 $this->node);
         }
-        $this->function_name = $this->ctx->class === null ?
+        $this->function_name = $this->ctx->classtype === null ?
             $this->ctx->namespace . $this->node->children['name'] : $this->node->children['name'];
-        $this->declaring_class = $this->ctx->class;
+        $this->declaring_class = $this->ctx->classtype;
         for ($i = 0; $i < count($this->node->children['params']->children); ++$i) {
             $param = $this->node->children['params']->children[$i];
-            $type_hint = $this->ctx->reflection_type_from_ast($param->children['type']);
+            if ($param->children['default'] === null) {
+                $default_type = null;
+            }
+            else {
+                $default_type = get_primitive_type($param->children['default']);
+            }
+            $type_hint = $this->ctx->reflection_type_from_ast($param->children['type'], $default_type === 'null');
             if (($param->flags & \ast\flags\PARAM_VARIADIC) && $param->children['default'] !== null) {
                 $this->ctx->error("A variadic parameter cannot have a default value", $param);
             }
@@ -1041,11 +1112,7 @@ trait AST_ReflectionFunctionAbstract
                     $this->ctx->error("Only the last parameter can be variadic", $this->node);
                 }
             }
-            if ($param->children['default'] === null) {
-                continue;
-            }
-            $default_type = get_primitive_type($param->children['default']);
-            if (!type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
+            if ($default_type !== null && !type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
                 $type_str = type_to_string([$type_hint]);
                 $this->ctx->error(
                     "Mismatch between type hint `$type_str` and default value type `$default_type` " .
@@ -1102,6 +1169,93 @@ trait AST_ReflectionFunctionAbstract
     function getParameters(): array
     {
         return $this->parameters;
+    }
+}
+
+class TypeWithIgnoredMethod
+{
+    function __construct(public string $ignored_method) {}
+
+    function __toString() # needed for `array_unique`
+    {
+        return self::class . "::" . $this->ignored_method;
+    }
+}
+
+class IgnoredFunction extends \ReflectionFunctionAbstract
+{
+    function __construct(private string $function_name)
+    {}
+
+    function __toString()  # Must implement this abstract method
+    {
+        return $this->function_name;
+    }
+
+    function isAbstract(): bool
+    {
+        return false;
+    }
+
+    function getReturnType(): ?\ReflectionType
+    {
+        return null;
+    }
+
+    function getName(): string
+    {
+        return $this->function_name;
+    }
+
+    function isVariadic(): bool
+    {
+        return true;
+    }
+
+    function getParameters(): array
+    {
+        return [];
+    }
+}
+
+class IgnoredClass extends \ReflectionClass
+{
+    function __construct(private string $class_name)
+    {}
+
+    function __toString()
+    {
+        return $this->class_name;
+    }
+
+    function getName(): string
+    {
+        return $this->class_name;
+    }
+
+    function hasMethod(string $name): bool
+    {
+        return true;
+    }
+
+    function getInterfaceNames(): array
+    {
+        return [];
+    }
+
+    function getParentClass(): false|\ReflectionClass
+    {
+        return false;
+    }
+
+    function isAbstract(): bool
+    {
+        return false;
+    }
+
+    function getConstructor(): ?\ReflectionMethod
+    {
+        return null;
     }
 }
 
@@ -1289,11 +1443,9 @@ class AST_ReflectionClass extends \ReflectionClass
                         "than the definition in the interface", $this->node);
                 }
                 if ($imethod->getReturnType() !== null) {
-                    $iret = type_to_string([$imethod->getReturnType()], true);
-                    $ret = type_to_string([$method->getReturnType()], true);
-                    if($iret !== $ret) {
-                    $this->ctx->error("Method `{$method->getName()}` has a different return type " .
-                        "compared to the definition in the interface", $this->node);
+                    if (!type_has_supertype($this->ctx, [$method->getReturnType()], [$imethod->getReturnType()])) {
+                            $this->ctx->error("Method `{$method->getName()}` has a different return type " .
+                            "compared to the definition in the interface", $this->node);
                     }
                 }
             }
@@ -1346,7 +1498,7 @@ class AST_ReflectionClass extends \ReflectionClass
             return;
         }
         $this->is_initialized = true;
-        $this->ctx->class = $this;
+        $this->ctx->classtype = $this;
         $this->ctx->file_name = $this->file_name;
         $this->ctx->namespace = $this->namespace;
         $this->ctx->use_aliases = $this->use_aliases;
@@ -1358,9 +1510,13 @@ class AST_ReflectionClass extends \ReflectionClass
         $implements_lowercase = [];
         foreach ($this->node->children['implements']?->children ?? [] as $interface) {
             $interface_name = $this->ctx->fq_class_name($interface);
-            $class = $this->ctx->get_class($interface_name);
+            $class = $this->ctx->get_classtype($interface_name);
             if ($class === null) {
                 $this->ctx->error("Interface `$interface_name` is undefined", $interface);
+                continue;
+            }
+            if (!$class->isInterface()) {
+                $this->ctx->error("Type `$interface_name` is not an interface", $interface);
                 continue;
             }
             if ($class instanceof AST_ReflectionClass) {
@@ -1385,36 +1541,45 @@ class AST_ReflectionClass extends \ReflectionClass
 
         ### Processing the parent class
 
+
         $parent_methods = [];
         $parent_constants = [];
         $parent_properties = [];
         if ($this->node->children['extends'] !== null) {
             $class_name = $this->ctx->fq_class_name($this->node->children['extends']);
-            if (!$this->ctx->class_exists($class_name)) {
-                $this->ctx->error(
-                    "Parent class `$class_name` does not exist", $this->node->children['extends']);
-            }
-            else {
-                $this->extends = $this->ctx->get_class($class_name);
-                if ($this->extends instanceof AST_ReflectionClass) {
-                    $this->extends->initialize(); # Must come before `process_class_stmts(…)`
+            $extends = $this->ctx->get_classtype($class_name);
+            while (true) {
+                if ($extends === null) {
+                    $this->ctx->error(
+                        "Parent class `$class_name` does not exist", $this->node->children['extends']);
+                    break;
+                }
+                if ($extends->isInterface() || $extends->isTrait()) {
+                    $this->ctx->error(
+                        "Parent class `$class_name` is a trait or interface", $this->node->children['extends']);
+                    break;
+                }
+                if ($extends instanceof AST_ReflectionClass) {
+                    $extends->initialize(); # Must come before `process_class_stmts(…)`
                 }
                 $this->interface_names = [
-                    ...$this->interface_names, ...$this->extends->getInterfaceNames()
+                    ...$this->interface_names, ...$extends->getInterfaceNames()
                 ];
-                if ($this->extends->isFinal()) {
-                    $this->ctx->error("Cannot inherit from final class `{$this->extends->getName()}`",
-                        $this->node);
+                if ($extends->isFinal()) {
+                    $this->ctx->error("Cannot inherit from final class `{$extends->getName()}`",
+                    $this->node);
                 }
-                foreach ($this->extends->getMethods() as $method) {
+                foreach ($extends->getMethods() as $method) {
                     $parent_methods[strtolower($method->getName())] = $method;
                 }
-                foreach ($this->extends->getProperties() as $property) {
+                foreach ($extends->getProperties() as $property) {
                     $parent_properties[$property->getName()] = $property;
                 }
-                foreach ($this->extends->getReflectionConstants() as $constant) {
+                foreach ($extends->getReflectionConstants() as $constant) {
                     $parent_constants[$constant->getName()] = $constant;
                 }
+                $this->extends = $extends;
+                break;
             }
         }
 
@@ -1459,7 +1624,7 @@ class AST_ReflectionClass extends \ReflectionClass
             }
             foreach ($stmt->children['adaptations']?->children ?? [] as $adaptation) {
                 $class_name = $adaptation->children['method']->children['class']->children['name'];
-                $class = $this->ctx->get_class($class_name);
+                $class = $this->ctx->get_classtype($class_name);
                 if ($class === null) {
                     $this->ctx->error("Trait `$class_name` is undefined", $adaptation);
                     continue;
@@ -1470,7 +1635,7 @@ class AST_ReflectionClass extends \ReflectionClass
                 }
                 foreach ($adaptation->children['insteadof']->children as $insteadof) {
                     $insteadof_name = $insteadof->children['name'];
-                    if (!$this->ctx->get_class($insteadof_name)?->isTrait()) {
+                    if (!$this->ctx->get_classtype($insteadof_name)?->isTrait()) {
                         $this->ctx->error("Trait `$insteadof_name` is undefined", $insteadof);
                     }
                 }
@@ -1478,7 +1643,7 @@ class AST_ReflectionClass extends \ReflectionClass
             }
             foreach ($stmt->children['traits']->children as $trait_node) {
                 $trait_name = $this->ctx->fq_class_name($trait_node);
-                $trait = $this->ctx->get_class($trait_name);
+                $trait = $this->ctx->get_classtype($trait_name);
                 if (!$trait?->isTrait()) {
                     $this->ctx->error("Trait `$trait_name` does not exist", $trait_node);
                     continue;
@@ -1659,13 +1824,44 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
             goto end;
         }
         $class_name = $ctx->fq_class_name($node->children['class']);
-        if ($ctx->get_class($class_name) === null) {
-            $ctx->error("Class `$class_name` is undefined", $node);
+        if ($ctx->get_classtype($class_name) === null) {
+            $ctx->error("Type `$class_name` is undefined", $node);
             goto end;
         }
         $var = $node->children['expr']->children['name'];
         if (array_key_exists($var, $ctx->defined_variables)) {
             $ctx->add_defined_variable($var, [$class_name]);
+        }
+    }
+    else if ($node->kind == \ast\AST_CALL &&
+            ($node->children['expr']->children['name'] ?? '') == 'function_exists' &&
+            count($node->children['args']->children) === 1 &&
+            is_string($node->children['args']->children[0]))
+    {
+        $function_name = $node->children['args']->children[0];
+        if (!array_key_exists(strtolower($function_name), $ctx->defined_functions)) {
+            $ctx->defined_functions[strtolower($function_name)] = new IgnoredFunction($function_name);
+        }
+    }
+    else if ($node->kind == \ast\AST_CALL &&
+            ($node->children['expr']->children['name'] ?? '') == 'class_exists' &&
+            count($node->children['args']->children) === 1 &&
+            is_string($node->children['args']->children[0]))
+    {
+        $class_name = $node->children['args']->children[0];
+        if (!array_key_exists(strtolower($class_name), $ctx->defined_classtypes)) {
+            $ctx->defined_classtypes[strtolower($class_name)] = new IgnoredClass($class_name);
+        }
+    }
+    else if ($node->kind == \ast\AST_CALL &&
+            ($node->children['expr']->children['name'] ?? '') === 'method_exists' &&
+            count($node->children['args']->children) === 2 &&
+            is_string($node->children['args']->children[1]))
+    {
+        $var = $node->children['args']->children[0];
+        if ($var instanceof \ast\Node && $var->kind == \ast\AST_VAR && is_string($var->children['name'])) {
+            $method_name = $node->children['args']->children[1];
+            $ctx->add_defined_variable($var->children['name'], [new TypeWithIgnoredMethod($method_name)]);
         }
     }
     else if ($node->kind === \ast\AST_CATCH) {
@@ -1675,7 +1871,7 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
         $possible_types = [];
         foreach ($node->children['class']->children as $class_node) {
             $class = $ctx->fq_class_name($class_node);
-            if ($ctx->class_exists($class) && !$ctx->interface_exists($class)) {
+            if ($ctx->classtype_exists($class)) {
                 $possible_types []= $class;
             }
         }
@@ -1685,6 +1881,13 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
     else if ($node->kind === \ast\AST_ASSIGN) {
         if ($node->children['var']->kind === \ast\AST_ARRAY) {
             add_variables_in_node($ctx, $node->children['var']);
+            goto end;
+        }
+        if ($node->children['var']->kind === \ast\AST_DIM &&
+            $node->children['var']->children['expr']->kind === \ast\AST_VAR)
+        {
+            # `$variable['key'] = 1;` defines `$variable` as an array
+            $ctx->add_defined_variable($node->children['var']->children['expr']->children['name'], ['array']);
             goto end;
         }
         $expr_types = get_possible_types($ctx, $node->children['expr']);
@@ -1725,6 +1928,9 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
         add_variables_in_node($ctx, $node->children['value']);
     }
     else if (in_array($node->kind, [\ast\AST_CALL, \ast\AST_METHOD_CALL, \ast\AST_STATIC_CALL])) {
+
+        # Add variables that may be passed by reference
+
         if ($node->children['args'] === \ast\AST_CALLABLE_CONVERT) {
             goto end;
         }
@@ -1910,8 +2116,8 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         $possible_types = [];
         foreach ($node->children['class']->children as $class_node) {
             $class = $ctx->fq_class_name($class_node);
-            if (!$ctx->class_exists($class) && !$ctx->interface_exists($class)) {
-                $ctx->error("Class `$class` is undefined", $node->children['class']);
+            if (!$ctx->classtype_exists($class)) {
+                $ctx->error("Type `$class` is undefined", $node->children['class']);
                 continue;
             }
             $possible_types []= $class;
@@ -1931,7 +2137,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         }
         if ($node->kind === \ast\AST_STATIC_CALL) {
             $parent_class_names = [];
-            if (($parent = $ctx->class) !== null) {
+            if (($parent = $ctx->classtype) !== null) {
                 while (($parent = $parent->getParentClass()) !== false) {
                     $parent_class_names []= strtolower($parent->getName());
                 }
@@ -1949,7 +2155,10 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         if (count($types) !== 1 || $types[0] === null) {
             return $ctx;
         }
-        $class = $ctx->get_class($types[0]);
+        $class = $ctx->get_classtype($types[0]);
+        if ($class === null) {
+            return $ctx;
+        }
         if ($class->isAbstract()) {
             $ctx->error("Cannot instantiate abstract class `{$class->getName()}`", $node);
             return $ctx;
@@ -1996,8 +2205,8 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
     }
     else if ($node->kind === \ast\AST_CLASS) {
         $ctx = clone $ctx;
-        $ctx->class = $ctx->get_class($ctx->namespace . $node->children['name']);
-        if ($ctx->class === null) {
+        $ctx->classtype = $ctx->get_classtype($ctx->namespace . $node->children['name']);
+        if ($ctx->classtype === null) {
             return null;  # Skipping analysis of redefined class
         }
     }
@@ -2025,9 +2234,9 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
             $ctx2->function->initialize();
         }
         else if ($node->kind === \ast\AST_METHOD) {
-            $ctx2->function = $ctx2->class->getMethod($node->children['name']);
+            $ctx2->function = $ctx2->classtype->getMethod($node->children['name']);
             if (!$ctx2->function->isStatic()) {
-                $ctx2->defined_variables['this'] = new DefinedVariable('this', [$ctx2->class->getName()]);
+                $ctx2->defined_variables['this'] = new DefinedVariable('this', [$ctx2->classtype->getName()]);
             }
         }
         else {
@@ -2113,10 +2322,12 @@ function get_string_constant_value(ASTContext $ctx, \ast\Node|string $node): ?st
 function traverse_classes_functions(ASTContext $ctx, \ast\Node $node): void
 {
     foreach ($node->children as $child) {
+        if (!($child instanceof \ast\Node)) {
+            continue;
+        }
         if ($child->kind === \ast\AST_INCLUDE_OR_EVAL && $child->flags !== \ast\flags\EXEC_EVAL) {
             $include_path = get_string_constant_value($ctx, $child->children['expr']);
             if ($include_path === null) {
-                $ctx->error("Unable to resolve the include path", $child);
                 continue;
             }
             if (is_link($include_path)) {
@@ -2148,6 +2359,14 @@ function traverse_classes_functions(ASTContext $ctx, \ast\Node $node): void
                 $ctx->defined_constants[$name] = $const->children['value'];
             }
         }
+        else if ($child->kind === \ast\AST_CALL &&
+                 ($child->children['expr']->children['name'] ?? '') === 'define' &&
+                 count($child->children['args']->children) == 2 &&
+                 is_string($child->children['args']->children[0]))
+        {
+            $name = strtolower($ctx->namespace) . $child->children['args']->children[0];
+            $ctx->defined_constants[$name] = $child->children['args']->children[1];
+        }
         else if ($child->kind === \ast\AST_NAMESPACE) {
             $ctx->use_aliases = [];
             $ctx->namespace = $child->children['name'] === null ? '' : $child->children['name'] . '\\';
@@ -2160,12 +2379,13 @@ function traverse_classes_functions(ASTContext $ctx, \ast\Node $node): void
         }
         else if ($child->kind === \ast\AST_CLASS) {
             $name = $ctx->namespace . $child->children['name'];
-            if ($ctx->class_exists($name) && !$ctx->make_self_check) {
-                $ctx->error("Redeclaration of class `$name`", $child);
-                $ctx->defined_classes[strtolower($name)] = null;
+            if ($ctx->classtype_exists($name) && !$ctx->make_self_check) {
+                $ctx->error("Redeclaration of type `$name`", $child);
+                $ctx->defined_classtypes[strtolower($name)] = null;
             }
-            $ctx->defined_classes[strtolower($name)] = new AST_ReflectionClass($ctx, $child);
-            $ctx->defined_interface_names []= strtolower($name);
+            $ctx->defined_classtypes[strtolower($name)] = new AST_ReflectionClass($ctx, $child);
+            # To find calls to `define`, `function_exists`, `method_exists`, `class_exists`
+            # traverse_classes_functions($ctx, $child->children['stmts']);
         }
         else if ($child->kind === \ast\AST_FUNC_DECL) {
             $name = $ctx->namespace . $child->children['name'];
@@ -2174,6 +2394,14 @@ function traverse_classes_functions(ASTContext $ctx, \ast\Node $node): void
                 continue;
             }
             $ctx->defined_functions[strtolower($name)] = new AST_ReflectionFunction($ctx, $child);
+            # To find calls to `define`, `function_exists`, `method_exists`, `class_exists`
+            # traverse_classes_functions($ctx, $child->children['stmts']);
+        }
+        else if ($child->kind === \ast\AST_METHOD) {
+            # To find calls to `define`, `function_exists`, `method_exists`, `class_exists`
+            # if ($child->children['stmts'] instanceof \ast\Node) {
+            #    traverse_classes_functions($ctx, $child->children['stmts']);
+            # }
         }
     }
 }
@@ -2207,17 +2435,22 @@ function main(array $argv): int
             Options:
             --ignore-file-prefix <prefix>
             \tIgnore files or directories with the specified prefix. Example value: `vendor/`.
-            --eval <file>
-            \tEvaluate the specified file before starting the analysis.
+            --require <file>
+            \tEvaluate the specified file using `require_once` before starting the analysis.
             \tIntended to support autoloading. Example value: `vendor/autoload.php`.
             --statistics
             \tPrint SLOC count and lists of the checked and of the ignored files.
+            --ignore-errors
+            \tComma-separated list of ignore keys. The ignore key of an error is a
+            \thash of the file name combined with the error message.
 
             EOT
         );
         return 0;
     }
     $ignored_file_prefixes = [];
+    $files = [];
+    $requires = [];
     $print_statistics = false;
     $ctx = new ASTContext;
     $ctx->make_self_check = in_array(__FILE__, array_map(realpath(...), array_slice($argv, 1)));
@@ -2229,21 +2462,34 @@ function main(array $argv): int
                 $prefix = preg_replace('|/[^/]*?/\.\.|', '', $prefix, -1, $count);
             } while ($count > 0);
             $ignored_file_prefixes []= $prefix;
-            continue;
         }
-        if ($argv[$i] === '--statistics') {
+        else if ($argv[$i] === '--statistics') {
             $print_statistics = true;
-            continue;
         }
-        if ($argv[$i] === '--eval' && $i < count($argv) - 1) {
-            require_once $argv[++$i];
-            continue;
+        else if ($argv[$i] === '--ignore-errors' && $i < count($argv) - 1) {
+            $ctx->ignored_errors = array_merge($ctx->ignored_errors, explode(',', $argv[++$i]));
         }
-        if (!is_file($argv[$i])) {
+        else if ($argv[$i] === '--require' && $i < count($argv) - 1) {
+            $requires []= $argv[++$i];
+        }
+        else if (!is_file($argv[$i])) {
             print("The file `{$argv[$i]}` does not exist\n");
-            return 1;
+            $ctx->has_error = true;
         }
-        load_source_file($ctx, $argv[$i]);
+        else {
+            $files []= $argv[$i];
+        }
+    }
+
+    foreach ($files as $file) {
+        load_source_file($ctx, $file);
+    }
+
+    # The autoloader must be executed after having loaded the source files to
+    # avoid false-positive errors about duplicate identifiers.
+
+    foreach ($requires as $require) {
+        require_once $require;
     }
     if ($ctx->has_error) { # Omitting further validation in case of syntax errors
         return 1;
@@ -2251,12 +2497,12 @@ function main(array $argv): int
 
     # Resolving type hints, traits, parent class/interfaces is only possible after having loaded all classes
 
-    foreach ($ctx->defined_classes as $defined_class) {
-        if ($defined_class !== null) {
-            $defined_class->initialize();
+    foreach ($ctx->defined_classtypes as $defined_classtype) {
+        if ($defined_classtype !== null) {
+            $defined_classtype->initialize();
         }
     }
-    $ctx->class = null;
+    $ctx->classtype = null;
     foreach ($ctx->defined_functions as $defined_function) {
         $defined_function->initialize();
     }

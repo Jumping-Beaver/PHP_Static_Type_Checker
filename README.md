@@ -2,12 +2,12 @@
 
 This is a fast and simple static code analyzer for PHP. It depends on the `php-ast` PECL extension.
 It resolves included files automatically and uses reflection to support any PECL extensions without
-requiring stubs.
+requiring stubs. The author can be contacted by e-mail at `jumping-beaver@mailbox.org`.
 
 ## How to install and use
 
 ```
-wget https://codeberg.org/Lerchensporn/php_static_type_checker/raw/branch/master/php_static_type_checker.php
+wget https://codeberg.org/Jumping-Beaver/php_static_type_checker/raw/branch/master/php_static_type_checker.php
 chmod +x php_static_type_checker.php
 ./php_static_type_checker.php
 ```
@@ -25,14 +25,13 @@ chmod +x php_static_type_checker.php
 - False positives are not desirable.
 
 - This application omits non-essential features in favor of performance and maintainability.
-  I regard the tool as “almost” feature-complete with the current feature set that fits in 2500 SLOC.
   Out of scope are:
    - extensive support for PHPDoc comments,
    - support for outdated PHP versions,
    - suggestions where to add more type hints,
    - detection of dead code and unused identifiers are of scope, since it creates no runtime
      defects and may obstruct debugging,
-   - sophisticated analysis of control structures.
+   - sophisticated analysis of control structures,
    - to validate assignments of constants and default values, because they may contain arithmetic
      expressions, which are too hard to evaluate.
 
@@ -44,7 +43,7 @@ The tool can now read all information from the AST, which took considerable effo
 duplication of what PHP does internally. One can think of possible approaches to improve this.
 
 One nasty aspect is PHP's autoloading functionality. It still requires to execute the
-`vendor/autoload.php` file using the `--eval` flag to get informed about the existing identifiers.
+`vendor/autoload.php` file using the `--require` flag to get informed about the existing identifiers.
 I dislike the autoloading approach also because what is actually loaded is intransparent and not
 explicit.
 
