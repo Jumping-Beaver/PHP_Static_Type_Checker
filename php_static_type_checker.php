@@ -468,10 +468,26 @@ function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): b
     return false;
 }
 
+function get_individual_types_str(array $types)
+{
+    foreach ($types as $type) {
+        if ($type instanceof \ReflectionUnionType) {
+            yield from array_map(fn ($t) => $t->getName(), $type->getTypes());
+        }
+        else if ($type instanceof \ReflectionNamedType) {
+            yield from [$type->getName()];
+        }
+        else {
+            yield from [$type];
+        }
+    }
+}
+
 function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=false,
     bool $is_in_assignment=false): array
 {
     # Return value `[null]` means we don't know the type, `[]` means the type is invalid.
+    # This function may return types that don't exist, when they are from incorrect type hints.
 
     assert($node !== null);
     if (!($node instanceof \ast\Node)) {
@@ -480,29 +496,40 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
     if ($node->kind === \ast\AST_ARRAY) {
         return ['array'];
     }
-    if ($node->kind === \ast\AST_CLASS_CONST || $node->kind === \ast\AST_STATIC_PROP) {
+    if (in_array($node->kind, [\ast\AST_CLASS_CONST, \ast\AST_CLASS_NAME, \ast\AST_STATIC_PROP])) {
         if ($node->kind === \ast\AST_CLASS_CONST && !is_string($node->children['const']) ||
             $node->kind === \ast\AST_STATIC_PROP && !is_string($node->children['prop']))
         {
             return [null];
         }
+
         if ($node->children['class']->kind === \ast\AST_NAME) {
-            $possible_classes = [$ctx->fq_class_name($node->children['class'], $print_error)];
+            $possible_classtypes = [$ctx->fq_class_name($node->children['class'], $print_error)];
+            if ($ctx->get_classtype($possible_classtypes[0]) === null) {
+                if ($print_error) {
+                    $ctx->error("Class type `{$possible_classtypes[0]}` is undefined", $node->children['class']);
+                }
+                return $node->kind === \ast\AST_CLASS_NAME ? ['string'] : [null];
+            }
         }
         else {
-            $possible_classes = get_possible_types($ctx, $node->children['class'], $print_error);
-        }
-        if (in_array(null, $possible_classes)) {
-            return [null];
+            $possible_classtypes = get_possible_types($ctx, $node->children['class'], $print_error);
+            if ($node->kind === \ast\AST_CLASS_NAME) {
+                return ['string'];
+            }
+            $possible_classtypes = get_individual_types_str($possible_classtypes);
         }
         $possible_types = [];
-        foreach ($possible_classes as $possible_class) {
-            $class = $ctx->get_classtype($possible_class);
+        foreach ($possible_classtypes as $possible_classtype) {
+            if ($possible_classtype === null || $possible_classtype === 'string') {
+                return [null];
+            }
+            $class = $ctx->get_classtype($possible_classtype);
             if ($class === null) {
-                if ($print_error) {
-                    $ctx->error("Type `$possible_class` is undefined", $node->children['class']);
-                    $print_error = false;
-                }
+                return [null];
+            }
+            if ($node->kind === \ast\AST_CLASS_NAME) {
+                $possible_types []= 'string';
                 continue;
             }
             if ($node->kind === \ast\AST_CLASS_CONST) {
@@ -519,19 +546,19 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             if ($const_or_prop === false) {
                 continue;
             }
-            if (!$ctx->has_access($possible_class, $const_or_prop->getModifiers())) {
+            if (!$ctx->has_access($possible_classtype, $const_or_prop->getModifiers())) {
                 continue;
             }
             $possible_types []= $const_or_prop->getType();
         }
         if (count($possible_types) > 0) {
-            return $possible_types;
+            return array_unique($possible_types);
         }
         if ($print_error) {
             if ($node->kind === \ast\AST_CLASS_CONST) {
                 $ctx->error("Type constant `{$node->children['const']}` is undefined or inaccessible", $node);
             }
-            else {
+            else if ($node->kind === \ast\AST_STATIC_PROP) {
                 $ctx->error("Type property `{$node->children['prop']}` is undefined or inaccessible", $node);
             }
         }
@@ -590,44 +617,33 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             return [null];
         }
         $possible_types = [];
-        foreach ($possible_expr_types as $possible_expr_type) {
-            if ($possible_expr_type instanceof \ReflectionUnionType) {
-                $possible_expr_type = array_map(fn ($t) => $t->getName(), $possible_expr_type->getTypes());
+        foreach (get_individual_types_str($possible_expr_types) as $type_name) {
+            if (in_array(strtolower($type_name), ['stdclass', 'object', 'mixed'])) {
+                return [null];
             }
-            else if ($possible_expr_type instanceof \ReflectionNamedType) {
-                $possible_expr_type = [$possible_expr_type->getName()];
+            if (in_array($type_name, NON_CLASS_TYPES)) {
+                continue;
             }
-            else {
-                $possible_expr_type = [$possible_expr_type];
+            $class = $ctx->get_classtype($type_name);
+            if ($class === null) {
+                return [null];
             }
-            foreach ($possible_expr_type as $type_name) {
-                if (in_array(strtolower($type_name), ['stdclass', 'object', 'mixed'])) {
-                    return [null];
-                }
-                if (in_array($type_name, NON_CLASS_TYPES)) {
-                    continue;
-                }
-                $class = $ctx->get_classtype($type_name);
-                if ($class === null) {
-                    return [null];
-                }
-                if (!$is_in_assignment && $class->hasMethod('__get') ||
-                    $is_in_assignment && $class->hasMethod('__set'))
-                {
-                    return [null];
-                }
-                if (!$class->hasProperty($node->children['prop'])) {
-                    continue;
-                }
-                $prop = $class->getProperty($node->children['prop']);
-                if (!$ctx->has_access($type_name, $prop->getModifiers())) {
-                    continue;
-                }
-                if ($prop->getModifiers() & \ast\flags\MODIFIER_STATIC) {
-                    continue;
-                }
-                $possible_types []= $prop->getType();
+            if (!$is_in_assignment && $class->hasMethod('__get') ||
+                $is_in_assignment && $class->hasMethod('__set'))
+            {
+                return [null];
             }
+            if (!$class->hasProperty($node->children['prop'])) {
+                continue;
+            }
+            $prop = $class->getProperty($node->children['prop']);
+            if (!$ctx->has_access($type_name, $prop->getModifiers())) {
+                continue;
+            }
+            if ($prop->getModifiers() & \ast\flags\MODIFIER_STATIC) {
+                continue;
+            }
+            $possible_types []= $prop->getType();
         }
         if (count($possible_types) === 0) {
             $possible_expr_types_str = type_to_string($possible_expr_types);
@@ -2266,7 +2282,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
 
 function validate_ast_children(ASTContext $ctx, \ast\Node $node, ?\ast\Node $parent_node=null): void
 {
-    $prop_kinds = [\ast\AST_CLASS_CONST, \ast\AST_STATIC_PROP, \ast\AST_PROP];
+    $prop_kinds = [\ast\AST_CLASS_CONST, \ast\AST_CLASS_NAME, \ast\AST_STATIC_PROP, \ast\AST_PROP];
     if (in_array($node->kind, $prop_kinds) && !in_array($parent_node?->kind, $prop_kinds)) {
         get_possible_types($ctx, $node, true, $ctx->is_in_assignment);
     }
