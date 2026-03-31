@@ -7,8 +7,12 @@ const NON_CLASS_TYPES = ['int', 'float', 'string', 'null', 'bool', 'false', 'tru
 
 class DefinedVariable
 {
-    function __construct(public string $name, public array $possible_types)
-    {}
+    function __construct(public string $name, public ?array $possible_types)
+    {
+        if ($possible_types !== null && count($possible_types) === 0) {
+            throw new \Exception;
+        }
+    }
 }
 
 class ASTContext
@@ -27,7 +31,7 @@ class ASTContext
     public array $defined_constants = [];
     public bool $has_error = false;
     public bool $has_return = false;
-    public string $namespace='';
+    public string $namespace = '';
     public string $file_name;
     public array $global_scope_variables;
     public array $use_aliases = [];
@@ -42,13 +46,16 @@ class ASTContext
         $this->reset_defined_variables();
     }
 
-    function add_defined_variable(string $var, array $type_list)
+    function add_defined_variable(string $var, ?array $type_list)
     {
-        if (!array_key_exists($var, $this->defined_variables) || $type_list === [null]) {
+        if ($type_list !== null && in_array(null, $type_list)) {
+            $type_list = null;
+        }
+        if (!array_key_exists($var, $this->defined_variables) || $type_list === null) {
             $this->defined_variables[$var] = new DefinedVariable($var, $type_list);
             return;
         }
-        if ($this->defined_variables[$var]->possible_types === [null]) {
+        if ($this->defined_variables[$var]->possible_types === null) {
             return;
         }
         $this->defined_variables[$var]->possible_types =
@@ -160,7 +167,7 @@ class ASTContext
 
     function class_exists(string $name)
     {
-        $class = this->defined_classtypes[strtolower($name)] ?? null;
+        $class = $this->defined_classtypes[strtolower($name)] ?? null;
         return $class !== null && !$class->isInterface() && !$class->isTrait() || class_exists($name);
     }
 
@@ -242,7 +249,7 @@ class ASTContext
             return null;
         }
         if ($node->kind === \ast\AST_TYPE_UNION) {
-            return new AST_ReflectionUnionType($this, $node, $has_default_null);
+            return AST_ReflectionUnionType::try_create($this, $node, $has_default_null);
         }
         else if ($node->kind === \ast\AST_TYPE_INTERSECTION) {
             return new AST_ReflectionIntersectionType($this, $node);
@@ -371,19 +378,13 @@ function get_primitive_type(mixed $x): ?string
     return null;
 }
 
-function type_has_supertype(ASTContext $ctx, array $types, array $supertypes): bool
+function type_has_supertype(ASTContext $ctx, ?array $types, ?array $supertypes): bool
 {
-    if (count($types) === 0 || count($supertypes) === 0) {
+    if ($types === null || $supertypes === null) {
         return true;
     }
     foreach ($types as $type) {
-        if ($type === null) {
-            return true;
-        }
         foreach ($supertypes as $supertype) {
-            if ($supertype === null) {
-                return true;
-            }
             if ($type instanceof \ReflectionUnionType || $type instanceof \ReflectionIntersectionType &&
                 !($supertype instanceof \ReflectionIntersectionType))
             {
@@ -484,14 +485,20 @@ function get_individual_types_str(array $types)
 }
 
 function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=false,
-    bool $is_in_assignment=false): array
+    bool $is_in_assignment=false): ?array
 {
-    # Return value `[null]` means we don't know the type, `[]` means the type is invalid.
-    # This function may return types that don't exist, when they are from incorrect type hints.
+    # Return value null means that the return value shall not be further processed because we
+    # don't know the type or the type is invalid. `null` values in the returned array and and
+    # returning an empty array are not allowed.
+    #
+    # This function may return types that don't exist
+    # when they are from incorrect type hints. `$print_error` controls whether this function
+    # prints errors about non-existent types.
 
     assert($node !== null);
     if (!($node instanceof \ast\Node)) {
-        return [get_primitive_type($node)];
+        $type = get_primitive_type($node);
+        return $type === null ? null : [$type];
     }
     if ($node->kind === \ast\AST_ARRAY) {
         return ['array'];
@@ -500,7 +507,7 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
         if ($node->kind === \ast\AST_CLASS_CONST && !is_string($node->children['const']) ||
             $node->kind === \ast\AST_STATIC_PROP && !is_string($node->children['prop']))
         {
-            return [null];
+            return null;
         }
 
         if ($node->children['class']->kind === \ast\AST_NAME) {
@@ -509,7 +516,7 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                 if ($print_error) {
                     $ctx->error("Class type `{$possible_classtypes[0]}` is undefined", $node->children['class']);
                 }
-                return $node->kind === \ast\AST_CLASS_NAME ? ['string'] : [null];
+                return $node->kind === \ast\AST_CLASS_NAME ? ['string'] : null;
             }
         }
         else {
@@ -517,16 +524,22 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             if ($node->kind === \ast\AST_CLASS_NAME) {
                 return ['string'];
             }
+            if ($possible_classtypes === null) {
+                return null;
+            }
             $possible_classtypes = get_individual_types_str($possible_classtypes);
         }
         $possible_types = [];
         foreach ($possible_classtypes as $possible_classtype) {
-            if ($possible_classtype === null || $possible_classtype === 'string') {
-                return [null];
+            if (strtolower($possible_classtype) === 'string') {
+                return null;
+            }
+            if (in_array($possible_classtype, NON_CLASS_TYPES)) {
+                continue;
             }
             $class = $ctx->get_classtype($possible_classtype);
             if ($class === null) {
-                return [null];
+                return null;
             }
             if ($node->kind === \ast\AST_CLASS_NAME) {
                 $possible_types []= 'string';
@@ -551,87 +564,86 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             }
             $possible_types []= $const_or_prop->getType();
         }
-        if (count($possible_types) > 0) {
-            return array_unique($possible_types);
-        }
-        if ($print_error) {
-            if ($node->kind === \ast\AST_CLASS_CONST) {
-                $ctx->error("Type constant `{$node->children['const']}` is undefined or inaccessible", $node);
+        if (count($possible_types) === 0) {
+            if ($print_error) {
+                if ($node->kind === \ast\AST_CLASS_CONST) {
+                    $ctx->error("Type constant `{$node->children['const']}` is undefined or inaccessible", $node);
+                }
+                else if ($node->kind === \ast\AST_STATIC_PROP) {
+                    $ctx->error("Type property `{$node->children['prop']}` is undefined or inaccessible", $node);
+                }
             }
-            else if ($node->kind === \ast\AST_STATIC_PROP) {
-                $ctx->error("Type property `{$node->children['prop']}` is undefined or inaccessible", $node);
-            }
+            return null;
         }
-        return [null];
+        return in_array(null, $possible_types) ? null : array_unique($possible_types);
     }
     if ($node->kind === \ast\AST_CONST) {
-        return [$ctx->get_constant_type($node->children['name'])];
+        $type = $ctx->get_constant_type($node->children['name']);
+        return $type === null ? null : [$type];
     }
     if ($node->kind === \ast\AST_METHOD_CALL || $node->kind === \ast\AST_STATIC_CALL) {
         if ($node->children['args']->kind === \ast\AST_CALLABLE_CONVERT) {
             return ['Closure'];
         }
-        $possible_methods = get_possible_methods($ctx, $node, false);
-        if ($possible_methods === null || count($possible_methods) === 0) {
-            return [null];
-        }
-        return array_map(fn ($t) => $t->getReturnType(), $possible_methods);
+        $possible_methods = get_possible_methods($ctx, $node, false) ?? [];
+        $types = array_unique(array_map(fn ($t) => $t->getReturnType(), $possible_methods));
+        return in_array(null, $types) || count($types) === 0 ? null : $types;
     }
     if ($node->kind === \ast\AST_CALL) {
         if ($node->children['args']->kind === \ast\AST_CALLABLE_CONVERT) {
             return ['Closure'];
         }
         if ($node->children['expr']->kind === \ast\AST_NAME) {
-            return [$ctx->get_function($node->children['expr'])?->getReturnType()];
+            $type = $ctx->get_function($node->children['expr'])?->getReturnType();
+            return $type === null ? null : [$type];
         }
     }
     if ($node->kind === \ast\AST_NEW) {
         if ($node->children['class']->kind !== \ast\AST_NAME) {
-            return [null];
+            return null;
         }
         $class_name = $ctx->fq_class_name($node->children['class'], $print_error);
-        return [$class_name];
         if (!$ctx->class_exists($class_name)) {
             if ($print_error) {
                 $ctx->error("Class `$class_name` is undefined", $node->children['class']);
             }
-            return [];
+            return null;
         }
         return [$class_name];
     }
     if ($node->kind === \ast\AST_VAR) {
         if ($node->children['name'] instanceof \ast\Node) {
-            return [null];
+            return null;
         }
         if (!array_key_exists($node->children['name'], $ctx->defined_variables)) {
-            return [];
+            return null;
         }
         return $ctx->defined_variables[$node->children['name']]->possible_types;
     }
-    if ($node->kind === \ast\AST_PROP) {
+    if ($node->kind === \ast\AST_PROP) {return null;
         if (!is_string($node->children['prop'])) {
-            return [null];
+            return null;
         }
         $possible_expr_types = get_possible_types($ctx, $node->children['expr'], $print_error);
-        if (count($possible_expr_types) === 0 || $possible_expr_types === [null]) {
-            return [null];
+        if ($possible_expr_types === null) {
+            return null;
         }
         $possible_types = [];
         foreach (get_individual_types_str($possible_expr_types) as $type_name) {
             if (in_array(strtolower($type_name), ['stdclass', 'object', 'mixed'])) {
-                return [null];
+                return null;
             }
             if (in_array($type_name, NON_CLASS_TYPES)) {
                 continue;
             }
             $class = $ctx->get_classtype($type_name);
             if ($class === null) {
-                return [null];
+                return null;
             }
             if (!$is_in_assignment && $class->hasMethod('__get') ||
                 $is_in_assignment && $class->hasMethod('__set'))
             {
-                return [null];
+                return null;
             }
             if (!$class->hasProperty($node->children['prop'])) {
                 continue;
@@ -651,11 +663,11 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                 $ctx->error("Property `{$node->children['prop']}` of variable of type " .
                     "`$possible_expr_types_str` is undefined or inaccessible", $node);
             }
-            return [null];
+            return null;
         }
-        return array_unique($possible_types);
+        return in_array(null, $possible_types) ? null : array_unique($possible_types);
     }
-    return [null];
+    return null;
 }
 
 function get_function_signature(\ReflectionFunctionAbstract $function): string
@@ -735,7 +747,7 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
             continue;
         }
         $arg_types = get_possible_types($ctx, $arg);
-        if (!type_has_supertype($ctx, $arg_types, [$parameter_type])) {
+        if ($arg_types !== null && !type_has_supertype($ctx, $arg_types, [$parameter_type])) {
             $arg_types_str = type_to_string($arg_types);
             $parameter_types_str = type_to_string([$parameter_type]);
             $index += 1;
@@ -753,9 +765,6 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
 
 function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_error): ?array
 {
-    # Return value: `null` means unknown but possibly valid method or we want to suppress further
-    # error messages, `[]` means we know that the method does not exist.
-
     if (!is_string($node->children['method'])) {
         return null;
     }
@@ -767,7 +776,7 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
                 if ($print_error) {
                     $ctx->error("Type `$possible_types[0]` is undefined", $node);
                 }
-                $possible_types = [];
+                return null;
             }
         }
         else { # Example: `$variable::method()`
@@ -778,7 +787,7 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         $is_static_call = false;
         $possible_types = get_possible_types($ctx, $node->children['expr']);
     }
-    if ($possible_types === []) {
+    if ($possible_types === null) {
         return null;
     }
     $possible_methods = [];
@@ -827,6 +836,10 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
             $possible_methods []= $method;
         }
     }
+    if ($print_error && count($possible_methods) === 0) {
+        $ctx->error("Method `{$node->children['method']}` is undefined or inaccessible", $node);
+        return null;
+    }
     return $possible_methods;
 }
 
@@ -862,6 +875,16 @@ class AST_ReflectionUnionType extends \ReflectionUnionType
 {
     private array $types = [];
 
+    static function try_create(ASTContext $ctx, \ast\Node $node, bool $has_default_null): ?\ReflectionUnionType
+    {
+        try {
+            return new self(...func_get_args());
+        }
+        catch (\TypeError) {
+            return null;
+        }
+    }
+
     function __construct(private ASTContext $ctx, \ast\Node $node, bool $has_default_null)
     {
         foreach ($node->children as $child) {
@@ -879,10 +902,14 @@ class AST_ReflectionUnionType extends \ReflectionUnionType
                     break;
                 }
             }
-            $this->types []= AST_ReflectionNamedType::try_create($ctx, $child, false);
+            $type = AST_ReflectionNamedType::try_create($ctx, $child, false);
+            if ($type === null) {
+                throw new \TypeError;
+            }
+            $this->types []= $type;
         }
         if ($has_default_null) {
-            $this->types []= AST_ReflectionNamedType::try_create($ctx, 'null', false);
+            $this->types []= new AST_ReflectionNamedType($ctx, 'null', false);
         }
     }
 
@@ -1128,7 +1155,9 @@ trait AST_ReflectionFunctionAbstract
                     $this->ctx->error("Only the last parameter can be variadic", $this->node);
                 }
             }
-            if ($default_type !== null && !type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
+            if ($default_type !== null && $type_hint !== null &&
+                !type_has_supertype($this->ctx, [$default_type], [$type_hint]))
+            {
                 $type_str = type_to_string([$type_hint]);
                 $this->ctx->error(
                     "Mismatch between type hint `$type_str` and default value type `$default_type` " .
@@ -1379,7 +1408,9 @@ class AST_ReflectionClass extends \ReflectionClass
                     continue;
                 }
                 $default_type = get_primitive_type($default);
-                if (!type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
+                if ($default_type !== null && $type_hint !== null &&
+                    !type_has_supertype($this->ctx, [$default_type], [$type_hint]))
+                {
                     $type_str = type_to_string([$type_hint]);
                     $this->ctx->error(
                         "Mismatch between type hint `$type_str` and default value type `$default_type` " .
@@ -1398,7 +1429,9 @@ class AST_ReflectionClass extends \ReflectionClass
                 }
                 $value_type = get_primitive_type($const->children['value']);
                 $value_type = AST_ReflectionNamedType::try_create($this->ctx, $value_type, false);
-                if (!type_has_supertype($this->ctx, [$value_type], [$type_hint])) {
+                if ($value_type !== null && $type_hint !== null &&
+                    !type_has_supertype($this->ctx, [$value_type], [$type_hint]))
+                {
                     $type_str = type_to_string([$type_hint]);
                     $this->ctx->error(
                         "Mismatch between type hint `$type_str` and value type `$value_type` " .
@@ -1826,7 +1859,7 @@ function add_variables_in_node(ASTContext $ctx, \ast\Node $node): void
         add_variables_in_node($ctx, $node->children['var']);
     }
     else if ($node->kind === \ast\AST_VAR && is_string($node->children['name'])) {
-        $ctx->add_defined_variable($node->children['name'], [null]);
+        $ctx->add_defined_variable($node->children['name'], null);
     }
 }
 
@@ -1892,7 +1925,7 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
             }
         }
         $var = $node->children['var']->children['name'];
-        $ctx->add_defined_variable($var, $possible_types);
+        $ctx->add_defined_variable($var, $possible_types === [] ? null : $possible_types);
     }
     else if ($node->kind === \ast\AST_ASSIGN) {
         if ($node->children['var']->kind === \ast\AST_ARRAY) {
@@ -1932,14 +1965,14 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
     else if ($node->kind === \ast\AST_CLOSURE) {
         foreach ($node->children['uses']->children ?? [] as $use) {
             if ($use->flags === \ast\flags\CLOSURE_USE_REF) {
-                $ctx->add_defined_variable($use->children['name'], [null]);
+                $ctx->add_defined_variable($use->children['name'], null);
             }
         }
         return; # Not visiting the closure statements
     }
     else if ($node->kind === \ast\AST_FOREACH) {
         if (is_string($node->children['key']?->children['name'] ?? null)) {
-            $ctx->add_defined_variable($node->children['key']->children['name'], [null]);
+            $ctx->add_defined_variable($node->children['key']->children['name'], null);
         }
         add_variables_in_node($ctx, $node->children['value']);
     }
@@ -1999,7 +2032,7 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
                 continue;
             }
             if ($parameter === null) {
-                $ctx->add_defined_variable($var, [null]);
+                $ctx->add_defined_variable($var, null);
             }
             else if ($parameter->isPassedByReference()) {
                 $ctx->add_defined_variable($var, [$parameter->getType()]);
@@ -2041,11 +2074,11 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         $node->flags === \ast\flags\BINARY_IS_NOT_IDENTICAL))
     {
         $left_types = get_possible_types($ctx, $node->children['left']);
-        if ($left_types === [null] || $left_types === []) {
+        if ($left_types === null) {
             return $ctx;
         }
         $right_types = get_possible_types($ctx, $node->children['right']);
-        if ($right_types === [null] || $right_types === []) {
+        if ($right_types === null) {
             return $ctx;
         }
         $left_types = explode('|', type_to_string($left_types));
@@ -2145,9 +2178,6 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
     }
     else if ($node->kind === \ast\AST_METHOD_CALL || $node->kind === \ast\AST_STATIC_CALL) {
         $possible_methods = get_possible_methods($ctx, $node, true);
-        if ($possible_methods === []) {
-            $ctx->error("Method `{$node->children['method']}` is undefined or inaccessible", $node);
-        }
         if ($possible_methods === null || count($possible_methods) !== 1) {
             return $ctx;
         }
@@ -2168,7 +2198,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
     }
     else if ($node->kind === \ast\AST_NEW) {
         $types = get_possible_types($ctx, $node, true);
-        if (count($types) !== 1 || $types[0] === null) {
+        if ($types === null || count($types) !== 1) {
             return $ctx;
         }
         $class = $ctx->get_classtype($types[0]);
@@ -2241,7 +2271,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
                     $ctx2->add_defined_variable($var, $ctx->defined_variables[$var]->possible_types);
                     continue;
                 }
-                $ctx2->add_defined_variable($var, [null]);
+                $ctx2->add_defined_variable($var, null);
                 if ($use->flags !== \ast\flags\CLOSURE_USE_REF) {
                     $ctx->error("Closure variable `$var` is undefined", $node);
                 }
