@@ -5,10 +5,19 @@ namespace StaticTypeChecker;
 
 const NON_CLASS_TYPES = ['int', 'float', 'string', 'null', 'bool', 'false', 'true', 'array', 'resource'];
 
-class CleanArray
+class TypeList
 {
     public readonly array $items;
-    function __construct(...$items)
+    function __construct(null|string|\ReflectionNamedType|\ReflectionUnionType|\ReflectionIntersectionType|TypeWithIgnoredMethod ...$items)
+    {
+        $this->items = in_array(null, $items) ? [] : array_unique($items);
+    }
+}
+
+class MethodList
+{
+    public readonly array $items;
+    function __construct(null|\ReflectionMethod|IgnoredFunction ...$items)
     {
         $this->items = in_array(null, $items) ? [] : array_unique($items);
     }
@@ -45,19 +54,19 @@ class ASTContext
         $this->reset_defined_variables();
     }
 
-    function add_defined_variable(string $var, array|CleanArray $types)
+    function add_defined_variable(string $var, array|TypeList $types)
     {
-        if ($types instanceof CleanArray) {
+        if ($types instanceof TypeList) {
             $types = $types->items;
         }
         if (!array_key_exists($var, $this->defined_variables) || count($types) === 0) {
-            $this->defined_variables[$var] = new CleanArray(...$types);
+            $this->defined_variables[$var] = new TypeList(...$types);
             return;
         }
         if (count($this->defined_variables[$var]->items) === 0) {
             return;
         }
-        $this->defined_variables[$var] = new CleanArray(...$this->defined_variables[$var]->items, ...$types);
+        $this->defined_variables[$var] = new TypeList(...$this->defined_variables[$var]->items, ...$types);
     }
 
     function reset_defined_variables()
@@ -324,12 +333,12 @@ class ASTContext
     }
 }
 
-function type_to_string(array|CleanArray $types, bool $sort=false): string
+function type_to_string(array|TypeList $types, bool $sort=false): string
 {
     # We do sort to compare two type hints, and don't sort to output precise error messages.
 
     if (is_array($types)) {
-        $types = new CleanArray(...$types);
+        $types = new TypeList(...$types);
     }
     $type_list = [];
     foreach ($types->items as $type) {
@@ -379,13 +388,13 @@ function get_primitive_type(mixed $x): ?string
     return null;
 }
 
-function type_has_supertype(ASTContext $ctx, array|CleanArray $types, array|CleanArray $supertypes): bool
+function type_has_supertype(ASTContext $ctx, array|TypeList $types, array|TypeList $supertypes): bool
 {
     if (is_array($types)) {
-        $types = new CleanArray(...$types);
+        $types = new TypeList(...$types);
     }
     if (is_array($supertypes)) {
-        $supertypes = new CleanArray(...$supertypes);
+        $supertypes = new TypeList(...$supertypes);
     }
     if (count($types->items) === 0 || count($supertypes->items) === 0) {
         return true;
@@ -478,7 +487,7 @@ function type_has_supertype(ASTContext $ctx, array|CleanArray $types, array|Clea
     return false;
 }
 
-function get_individual_types_str(CleanArray $types)
+function get_individual_types_str(TypeList $types)
 {
     foreach ($types->items as $type) {
         if ($type instanceof \ReflectionUnionType) {
@@ -494,7 +503,7 @@ function get_individual_types_str(CleanArray $types)
 }
 
 function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=false,
-    bool $is_in_assignment=false): CleanArray
+    bool $is_in_assignment=false): TypeList
 {
     # Return value `[]` means that the return value shall not be further processed because we
     # don't know the type or the type is invalid. `null` values in the returned array are not allowed.
@@ -505,16 +514,16 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
 
     assert($node !== null);
     if (!($node instanceof \ast\Node)) {
-        return new CleanArray(get_primitive_type($node));
+        return new TypeList(get_primitive_type($node));
     }
     if ($node->kind === \ast\AST_ARRAY) {
-        return new CleanArray('array');
+        return new TypeList('array');
     }
     if (in_array($node->kind, [\ast\AST_CLASS_CONST, \ast\AST_CLASS_NAME, \ast\AST_STATIC_PROP])) {
         if ($node->kind === \ast\AST_CLASS_CONST && !is_string($node->children['const']) ||
             $node->kind === \ast\AST_STATIC_PROP && !is_string($node->children['prop']))
         {
-            return new CleanArray;
+            return new TypeList;
         }
 
         if ($node->children['class']->kind === \ast\AST_NAME) {
@@ -523,30 +532,30 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                 if ($class_name !== null && $print_error) {
                     $ctx->error("Class type `$class_name` is undefined", $node->children['class']);
                 }
-                return $node->kind === \ast\AST_CLASS_NAME ? ['string'] : [];
+                return $node->kind === \ast\AST_CLASS_NAME ? new TypeList('string') : new TypeList;
             }
-            $possible_classtypes = new CleanArray($class_name);
+            $possible_classtypes = new TypeList($class_name);
         }
         else {
             $possible_classtypes = get_possible_types($ctx, $node->children['class'], $print_error);
             if ($node->kind === \ast\AST_CLASS_NAME) {
-                return new CleanArray('string');
+                return new TypeList('string');
             }
             if (count($possible_classtypes->items) === 0) {
-                return new CleanArray;
+                return new TypeList;
             }
         }
         $possible_types = [];
         foreach (get_individual_types_str($possible_classtypes) as $possible_classtype) {
             if (strtolower($possible_classtype) === 'string') {
-                return new CleanArray;
+                return new TypeList;
             }
             if (in_array($possible_classtype, NON_CLASS_TYPES)) {
                 continue;
             }
             $class = $ctx->get_classtype($possible_classtype);
             if ($class === null) {
-                return new CleanArray;
+                return new TypeList;
             }
             if ($node->kind === \ast\AST_CLASS_NAME) {
                 $possible_types []= 'string';
@@ -581,73 +590,73 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                 }
             }
         }
-        return new CleanArray(...$possible_types);
+        return new TypeList(...$possible_types);
     }
     if ($node->kind === \ast\AST_CONST) {
         $type = $ctx->get_constant_type($node->children['name']);
-        return new CleanArray($type);
+        return new TypeList($type);
     }
     if ($node->kind === \ast\AST_METHOD_CALL || $node->kind === \ast\AST_STATIC_CALL) {
         if ($node->children['args']->kind === \ast\AST_CALLABLE_CONVERT) {
-            return new CleanArray('Closure');
+            return new TypeList('Closure');
         }
         $possible_methods = get_possible_methods($ctx, $node, false);
-        return new CleanArray(...array_map(fn ($t) => $t->getReturnType(), $possible_methods->items));
+        return new TypeList(...array_map(fn ($t) => $t->getReturnType(), $possible_methods->items));
     }
     if ($node->kind === \ast\AST_CALL) {
         if ($node->children['args']->kind === \ast\AST_CALLABLE_CONVERT) {
-            return new CleanArray('Closure');
+            return new TypeList('Closure');
         }
         if ($node->children['expr']->kind === \ast\AST_NAME) {
-            return new CleanArray($ctx->get_function($node->children['expr'])?->getReturnType());
+            return new TypeList($ctx->get_function($node->children['expr'])?->getReturnType());
         }
     }
     if ($node->kind === \ast\AST_NEW) {
         if ($node->children['class']->kind !== \ast\AST_NAME) {
-            return new CleanArray;
+            return new TypeList;
         }
         $class_name = $ctx->fq_class_name($node->children['class'], $print_error);
         if (!$ctx->class_exists($class_name)) {
             if ($print_error) {
                 $ctx->error("Class `$class_name` is undefined", $node->children['class']);
             }
-            return new CleanArray;
+            return new TypeList;
         }
-        return new CleanArray($class_name);
+        return new TypeList($class_name);
     }
     if ($node->kind === \ast\AST_VAR) {
         if ($node->children['name'] instanceof \ast\Node) {
-            return new CleanArray;
+            return new TypeList;
         }
         if (!array_key_exists($node->children['name'], $ctx->defined_variables)) {
-            return new CleanArray;
+            return new TypeList;
         }
         return $ctx->defined_variables[$node->children['name']];
     }
     if ($node->kind === \ast\AST_PROP) {
         if (!is_string($node->children['prop'])) {
-            return new CleanArray;
+            return new TypeList;
         }
         $possible_expr_types = get_possible_types($ctx, $node->children['expr'], $print_error);
         if (count($possible_expr_types->items) === 0) {
-            return new CleanArray;
+            return new TypeList;
         }
         $possible_types = [];
         foreach (get_individual_types_str($possible_expr_types) as $type_name) {
             if (in_array(strtolower($type_name), ['stdclass', 'object', 'mixed'])) {
-                return new CleanArray;
+                return new TypeList;
             }
             if (in_array($type_name, NON_CLASS_TYPES)) {
                 continue;
             }
             $class = $ctx->get_classtype($type_name);
             if ($class === null) {
-                return new CleanArray;
+                return new TypeList;
             }
             if (!$is_in_assignment && $class->hasMethod('__get') ||
                 $is_in_assignment && $class->hasMethod('__set'))
             {
-                return new CleanArray;
+                return new TypeList;
             }
             if (!$class->hasProperty($node->children['prop'])) {
                 continue;
@@ -668,9 +677,9 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
                     "`$possible_expr_types_str` is undefined or inaccessible", $node);
             }
         }
-        return new CleanArray(...$possible_types);
+        return new TypeList(...$possible_types);
     }
-    return new CleanArray;
+    return new TypeList;
 }
 
 function get_function_signature(\ReflectionFunctionAbstract $function): string
@@ -685,13 +694,13 @@ function get_function_signature(\ReflectionFunctionAbstract $function): string
         if (!$first) {
             $signature .= ', ';
         }
-        $signature .= type_to_string(new CleanArray($parameter->getType()));
+        $signature .= type_to_string(new TypeList($parameter->getType()));
         $signature .= ' $' . $parameter->getName();
         $first = false;
     }
     $signature .= ')';
     if ($function->getReturnType() !== null) {
-        $signature .= ': ' . type_to_string(new CleanArray($function->getReturnType()));
+        $signature .= ': ' . type_to_string(new TypeList($function->getReturnType()));
     }
     return $signature;
 }
@@ -761,15 +770,16 @@ function validate_arguments(ASTContext $ctx, \ReflectionFunctionAbstract $functi
     }
     foreach ($unspecified_parameters as $p) {
         if (!$p->isOptional()) {
+            $signature = get_function_signature($function);
             $ctx->error("The call to `$signature` lacks the required argument `{$p->getName()}`", $node);
         }
     }
 }
 
-function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_error): CleanArray
+function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_error): MethodList
 {
     if (!is_string($node->children['method'])) {
-        return new CleanArray;
+        return new MethodList;
     }
     if (array_key_exists('class', $node->children)) { # Static call
         $is_static_call = true;
@@ -779,9 +789,9 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
                 if ($class_name !== null && $print_error) {
                     $ctx->error("Type `$class_name` is undefined", $node);
                 }
-                return new CleanArray;
+                return new MethodList;
             }
-            $possible_types = new CleanArray($class_name);
+            $possible_types = new TypeList($class_name);
         }
         else { # Example: `$variable::method()`
             $possible_types = get_possible_types($ctx, $node->children['class']);
@@ -792,7 +802,7 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         $possible_types = get_possible_types($ctx, $node->children['expr']);
     }
     if (count($possible_types->items) === 0) {
-        return new CleanArray;
+        return new MethodList;
     }
     $possible_methods = [];
     foreach ($possible_types->items as $possible_type) {
@@ -801,6 +811,9 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         }
         else if ($possible_type instanceof \ReflectionUnionType) {
             $possible_type = array_map(fn ($t) => $t->getName(), $possible_type->getTypes());
+        }
+        else if ($possible_type instanceof \ReflectionIntersectionType) {
+            $possible_type = [$possible_type->getTypes()[0]->getName()];
         }
         else if ($possible_type instanceof TypeWithIgnoredMethod) {
             if ($node->children['method'] === $possible_type->ignored_method) {
@@ -811,21 +824,18 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
         else if (is_string($possible_type)) {
             $possible_type = [$possible_type];
         }
-        else {
-            throw new \Exception();
-        }
         foreach ($possible_type as $type_name) {
             if (in_array($type_name, NON_CLASS_TYPES)) {
                 continue;
             }
             $class = $ctx->get_classtype($type_name);
             if ($class === null) {
-                return new CleanArray;
+                return new MethodList;
             }
             if ($is_static_call && $class->hasMethod('__callStatic') ||
                 !$is_static_call && $class->hasMethod('__call'))
             {
-                return new CleanArray;
+                return new MethodList;
             }
             if (!$class->hasMethod($node->children['method'])) {
                 continue;
@@ -840,7 +850,7 @@ function get_possible_methods(ASTContext $ctx, \ast\Node $node, bool $print_erro
     if ($print_error && count($possible_methods) === 0) {
         $ctx->error("Method `{$node->children['method']}` is undefined or inaccessible", $node);
     }
-    return new CleanArray(...$possible_methods);
+    return new MethodList(...$possible_methods);
 }
 
 class PossibleMethods
@@ -1145,23 +1155,23 @@ trait AST_ReflectionFunctionAbstract
                 $default_type = get_primitive_type($param->children['default']);
             }
             $type_hint = $this->ctx->reflection_type_from_ast($param->children['type'], $default_type === 'null');
-            if (($param->flags & \ast\flags\PARAM_VARIADIC) && $param->children['default'] !== null) {
-                $this->ctx->error("A variadic parameter cannot have a default value", $param);
-            }
-            $this->parameters []= new AST_ReflectionParameter($param, $type_hint);
             if (($param->flags & \ast\flags\PARAM_VARIADIC)) {
+                if ($param->children['default'] !== null) {
+                    $this->ctx->error("A variadic parameter cannot have a default value", $param);
+                }
                 $this->is_variadic = true;
                 if ($i < count($this->node->children['params']->children) - 1) {
                     $this->ctx->error("Only the last parameter can be variadic", $this->node);
                 }
             }
-            if (!type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
+            else if (!type_has_supertype($this->ctx, [$default_type], [$type_hint])) {
                 $type_str = type_to_string([$type_hint]);
                 $this->ctx->error(
                     "Mismatch between type hint `$type_str` and default value type `$default_type` " .
                     "for parameter `{$param->children['name']}`", $param
                 );
             }
+            $this->parameters []= new AST_ReflectionParameter($param, $type_hint);
         }
         if ($this->node->children['returnType'] !== null) {
             $this->return_type = $this->ctx->reflection_type_from_ast($this->node->children['returnType']);
@@ -2027,7 +2037,10 @@ function find_defined_variables(ASTContext $ctx, \ast\Node $node): void
             else {
                 continue;
             }
-            if ($parameter?->isPassedByReference()) {
+            if ($parameter === null) {
+                $ctx->add_defined_variable($var, []);
+            }
+            else if ($parameter?->isPassedByReference()) {
                 $ctx->add_defined_variable($var, [$parameter->getType()]);
             }
         }
@@ -2102,7 +2115,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         }
         $ctx->has_return = true;
         if ($node->children['expr'] === null) {
-            $returned_type = new CleanArray('void');
+            $returned_type = new TypeList('void');
         }
         else {
             $returned_type = get_possible_types($ctx, $node->children['expr']);
@@ -2166,7 +2179,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         }
         if ($node->children['var'] !== null) {
             $var = $node->children['var']->children['name'];
-            $ctx->defined_variables[$var] = new CleanArray(...$possible_types);
+            $ctx->defined_variables[$var] = new TypeList(...$possible_types);
         }
     }
     else if ($node->kind === \ast\AST_METHOD_CALL || $node->kind === \ast\AST_STATIC_CALL) {
@@ -2184,7 +2197,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
             if (!in_array(strtolower($node->children['class']->children['name']),
                 ['self', 'parent', ...$parent_class_names]) && !$possible_methods->items[0]->isStatic())
             {
-                $ctx->error("Method `{$possible_methods[0]->getName()}` is not static", $node);
+                $ctx->error("Method `{$possible_methods->items[0]->getName()}` is not static", $node);
             }
         }
         validate_arguments($ctx, $possible_methods->items[0], $node->children['args']);
@@ -2275,7 +2288,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         else if ($node->kind === \ast\AST_METHOD) {
             $ctx2->function = $ctx2->classtype->getMethod($node->children['name']);
             if (!$ctx2->function->isStatic()) {
-                $ctx2->defined_variables['this'] = new CleanArray($ctx2->classtype->getName());
+                $ctx2->defined_variables['this'] = new TypeList($ctx2->classtype->getName());
             }
         }
         else {
@@ -2285,7 +2298,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
         }
 
         foreach ($ctx2->function->getParameters() as $p) {
-            $ctx2->add_defined_variable($p->getName(), [$p->getType()]);
+            $ctx2->add_defined_variable($p->getName(), [$p->isVariadic() ? 'array' : $p->getType()]);
         }
         if ($node->children['stmts'] !== null) {
             find_defined_variables($ctx2, $node->children['stmts']);
