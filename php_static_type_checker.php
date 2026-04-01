@@ -519,6 +519,11 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
     if ($node->kind === \ast\AST_ARRAY) {
         return new TypeList('array');
     }
+    if ($node->kind === \ast\AST_CONDITIONAL) {
+        $true_types = get_possible_types($ctx, $node->children['true']);
+        $false_types = get_possible_types($ctx, $node->children['false']);
+        return new TypeList(...$true_types->items, ...$false_types->items);
+    }
     if (in_array($node->kind, [\ast\AST_CLASS_CONST, \ast\AST_CLASS_NAME, \ast\AST_STATIC_PROP])) {
         if ($node->kind === \ast\AST_CLASS_CONST && !is_string($node->children['const']) ||
             $node->kind === \ast\AST_STATIC_PROP && !is_string($node->children['prop']))
