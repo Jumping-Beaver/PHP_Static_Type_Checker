@@ -464,8 +464,8 @@ function type_has_supertype(ASTContext $ctx, array|TypeList $types, array|TypeLi
             }
             $type = strtolower($type);
             $supertype = strtolower($supertype);
-	    if ($type === 'mixed' || $supertype === 'mixed' ||
-		$supertype === 'object' && !in_array($type, NON_CLASS_TYPES) ||
+            if ($type === 'mixed' || $supertype === 'mixed' ||
+                $supertype === 'object' && !in_array($type, NON_CLASS_TYPES) ||
                 $type === 'object' && !in_array($supertype, NON_CLASS_TYPES) ||
                 $type === 'closure' && $supertype === 'callable' ||
                 $type === 'int' && $supertype === 'float' ||
@@ -606,7 +606,7 @@ function get_possible_types(ASTContext $ctx, mixed $node, bool $print_error=fals
             return new TypeList('Closure');
         }
         $possible_methods = get_possible_methods($ctx, $node, false);
-        return new TypeList(...array_map(fn ($t) => $t->getReturnType(), $possible_methods->items));
+        return new TypeList(...array_map(fn ($t) => get_return_type($ctx, $t), $possible_methods->items));
     }
     if ($node->kind === \ast\AST_CALL) {
         if ($node->children['args']->kind === \ast\AST_CALLABLE_CONVERT) {
@@ -704,8 +704,8 @@ function get_function_signature(\ReflectionFunctionAbstract $function): string
         $first = false;
     }
     $signature .= ')';
-    if ($function->getReturnType() !== null) {
-        $signature .= ': ' . type_to_string(new TypeList($function->getReturnType()));
+    if (get_return_type($ctx, $function) !== null) {
+        $signature .= ': ' . type_to_string(new TypeList(get_return_type($ctx, $function)));
     }
     return $signature;
 }
@@ -1240,6 +1240,18 @@ class TypeWithIgnoredMethod
     }
 }
 
+function get_return_type(ASTContext $ctx, \ReflectionFunctionAbstract $function): ?\ReflectionType
+{
+    $declaring_class = $function->getDeclaringClass();
+    $return_type = $function->getReturnType();
+    if ($declaring_class !== null && $return_type instanceof \ReflectionNamedType &&
+        ($return_type->getName() === 'static' || $return_type->getName() === 'self'))
+    {
+        return new AST_ReflectionNamedType($ctx, $declaring_class, $return_type->allowsNull());
+    }
+    return $return_type;
+}
+
 class IgnoredFunction extends \ReflectionFunctionAbstract
 {
     function __construct(private string $function_name)
@@ -1329,7 +1341,7 @@ class AST_ReflectionFunction extends \ReflectionFunctionAbstract
 
 class MethodMadeNonAbstract extends \ReflectionMethod
 {
-    function __construct(private \ReflectionMethod $method)
+    function __construct(private \ReflectionMethod $method, private \ReflectionClass $declaring_class)
     {}
 
     function isStatic(): bool
@@ -1345,6 +1357,26 @@ class MethodMadeNonAbstract extends \ReflectionMethod
     function getModifiers(): int
     {
         return $this->method->getModifiers() & ~\ast\flags\MODIFIER_ABSTRACT;
+    }
+
+    function getName(): string
+    {
+        return $this->method->getName();
+    }
+
+    function getDeclaringClass(): \ReflectionClass
+    {
+        return $this->declaring_class;
+    }
+
+    function isVariadic(): bool
+    {
+        return $this->method->isVariadic();
+    }
+
+    function getReturnType(): ?\ReflectionType
+    {
+        return $this->method->getReturnType();
     }
 
     function is_return_required(): bool
@@ -1393,7 +1425,7 @@ class AST_ReflectionClass extends \ReflectionClass
     }
 
     private function process_class_stmt(\ast\Node $stmt, array $interface_methods,
-        null|false|\ReflectionType $backing_type, ?\ReflectionType $enum_type)
+        null|\ReflectionType $backing_type, ?\ReflectionType $enum_type)
     {
         if ($stmt->kind === \ast\AST_PROP_GROUP) {
             if ($this->node->flags & \ast\flags\CLASS_INTERFACE) {
@@ -1502,8 +1534,8 @@ class AST_ReflectionClass extends \ReflectionClass
                     $this->ctx->error("Method `{$method->getName()}` has more parameters " .
                         "than the definition in the interface", $this->node);
                 }
-                if ($imethod->getReturnType() !== null) {
-                    if (!type_has_supertype($this->ctx, [$method->getReturnType()], [$imethod->getReturnType()])) {
+                if (get_return_type($ctx, $imethod) !== null) {
+                    if (!type_has_supertype($this->ctx, [get_return_type($ctx, $method)], [get_return_type($ctx, $imethod)])) {
                             $this->ctx->error("Method `{$method->getName()}` has a different return type " .
                             "compared to the definition in the interface", $this->node);
                     }
@@ -1536,15 +1568,13 @@ class AST_ReflectionClass extends \ReflectionClass
             }
             $name = $stmt->children['name'];
             $value = $stmt->children['expr'];
-            if ($backing_type === false && $value !== null) {
+            if ($backing_type === null && $value !== null) {
                 $this->ctx->error("Case `$name` of a non-backed enum must not have a value", $stmt);
             }
-            else if ($backing_type instanceof \ReflectionType && $value === null) {
+            else if ($backing_type !== null && $value === null) {
                 $this->ctx->error("Case `$name` of a backed enum must have a value", $stmt);
             }
-            else if ($backing_type instanceof \ReflectionType &&
-                ($backing_type?->getName() === 'string') !== is_string($value))
-            {
+            else if ($backing_type !== null && ($backing_type?->getName() === 'string') !== is_string($value)) {
                 $this->ctx->error("Type of case `$name` does not match the enum's backing type", $stmt);
             }
             $this->constants[$name] = new AST_ReflectionClassConstant($name, $enum_type,
@@ -1653,7 +1683,7 @@ class AST_ReflectionClass extends \ReflectionClass
                     'value', null, $backing_type, \ast\flags\MODIFIER_PUBLIC | \ast\flags\MODIFIER_READONLY
                 );
                 foreach ((new \ReflectionClass(\BackedEnum::class))->getMethods() as $method) {
-                    $this->methods[strtolower($method->getName())] = new MethodMadeNonAbstract($method);
+                    $this->methods[strtolower($method->getName())] = new MethodMadeNonAbstract($method, $this);
                 }
             }
             if ($backing_type instanceof \ReflectionNamedType &&
@@ -1668,7 +1698,7 @@ class AST_ReflectionClass extends \ReflectionClass
         }
         else {
             $enum_type = null;
-            $backing_type = false;
+            $backing_type = null;
         }
         foreach ($this->node->children['stmts']->children as $stmt) {
             $this->process_class_stmt($stmt, $interface_methods, $backing_type, $enum_type);
@@ -2153,7 +2183,7 @@ function validate_ast_node(ASTContext $ctx, \ast\Node $node): ?ASTContext
     }
     else if ($node->kind === \ast\AST_ASSIGN || $node->kind === \ast\AST_ASSIGN_OP) {
         if (!is_statement_writable($node->children['var'])) {
-            $ctx->error("The left-hand site of the assignment is not writable", $node);
+            $ctx->error('The left-hand site of the assignment is not writable', $node);
             return null;
         }
         if ($node->children['expr'] instanceof \ast\Node) {
